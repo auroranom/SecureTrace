@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "securetrace": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--project",
+        "/ABSOLUTE/PATH/TO/SECURETRACE",
+        "securetrace-mcp"
+      ],
+      "cwd": ".",
+      "trust": false
+    }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "securetrace-approval": {
+    "PreToolUse": [
+      {
+        "matcher": "edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "call .agents\\securetrace_hook.cmd pre_tool_use 2>nul || call securetrace_hook.cmd pre_tool_use",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "call .agents\\securetrace_hook.cmd post_tool_use 2>nul || call securetrace_hook.cmd post_tool_use",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

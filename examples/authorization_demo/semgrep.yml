@@ -1,0 +1,7 @@
+rules:
+  - id: securetrace.authorization.truthy-actor-only
+    languages:
+      - python
+    severity: WARNING
+    message: Actor identity alone does not establish record ownership.
+    pattern: return bool(actor_id)

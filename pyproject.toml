@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "securetrace"
+version = "0.1.0"
+description = "Continuous, evidence-backed security assurance for AI-built applications."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp>=1.2.0,<2",
+  "watchdog>=4.0.0",
+  "winotify>=1.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.6.0"]
+
+[project.scripts]
+securetrace = "securetrace.cli:main"
+securetrace-mcp = "securetrace.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["securetrace"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

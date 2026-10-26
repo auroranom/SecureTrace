@@ -1,0 +1,1 @@
+SecureTrace hook integration test
