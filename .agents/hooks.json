@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "call .agents\\securetrace_hook.cmd pre_tool_use 2>nul || call securetrace_hook.cmd pre_tool_use",
+            "command": "D:\\AASTHA\\Secure-trace-main\\.venv\\Scripts\\python.exe -m securetrace.hooks pre_tool_use",
             "timeout": 30
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "call .agents\\securetrace_hook.cmd post_tool_use 2>nul || call securetrace_hook.cmd post_tool_use",
+            "command": "D:\\AASTHA\\Secure-trace-main\\.venv\\Scripts\\python.exe -m securetrace.hooks post_tool_use",
             "timeout": 30
           }
         ]

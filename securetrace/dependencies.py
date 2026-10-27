@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import ast
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import importlib.util
 from pathlib import Path
 import re
@@ -61,6 +61,7 @@ class ResolvedImport:
     target_file: str | None
     classification: str  # "LOCAL", "STDLIB", "EXTERNAL", "UNRESOLVED", "ESCAPE_REJECTED"
     detail: str = ""
+    imported_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -81,6 +82,18 @@ class DependencyGraph:
     dynamic_import_warnings: dict[str, list[str]] = field(default_factory=dict)
     # analysis uncertainties (unresolved imports, warnings, errors)
     uncertainties: list[str] = field(default_factory=list)
+    # Structured incompleteness, keyed by the source file whose edges are not fully known.
+    # Each entry: {"kind": "UNPARSEABLE"|"DYNAMIC_IMPORT"|"UNRESOLVED_IMPORT", "detail": str,
+    # "tokens": [names an unresolved import could be satisfied by]}. Used to decide whether
+    # incompleteness can plausibly affect a registered requirement (see ledger.analyze_change_impact).
+    incomplete_sources: dict[str, list[dict]] = field(default_factory=dict)
+    # Start files whose dependent traversal hit the depth/node bound (results are then a lower bound).
+    truncated_traversals: set[str] = field(default_factory=set)
+
+    def _note_incomplete(self, source: str, kind: str, detail: str, tokens: tuple[str, ...] = ()) -> None:
+        self.incomplete_sources.setdefault(source, []).append(
+            {"kind": kind, "detail": detail, "tokens": list(tokens)}
+        )
 
     def get_direct_dependencies(self, file_path: str) -> set[str]:
         """Return the local files directly imported by file_path."""
@@ -93,8 +106,8 @@ class DependencyGraph:
     def get_transitive_dependents(
         self,
         file_path: str,
-        max_depth: int = MAX_TRAVERSAL_DEPTH,
-        max_nodes: int = MAX_VISITED_NODES,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
     ) -> set[str]:
         """Return all local files that transitively depend on file_path."""
         dependents, _ = self.get_transitive_dependents_with_paths(file_path, max_depth, max_nodes)
@@ -103,14 +116,20 @@ class DependencyGraph:
     def get_transitive_dependents_with_paths(
         self,
         file_path: str,
-        max_depth: int = MAX_TRAVERSAL_DEPTH,
-        max_nodes: int = MAX_VISITED_NODES,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
     ) -> tuple[set[str], dict[str, list[str]]]:
         """Return transitive dependents and the shortest dependency chain leading to each.
+
+        Bounds are read at call time. If a bound cuts the traversal short the start
+        file is recorded in ``truncated_traversals``: the result is then only a lower
+        bound and callers must not treat missing dependents as proof of absence.
 
         Returns:
             A tuple of (set of dependent file paths, mapping of dependent -> [chain of files]).
         """
+        max_depth = MAX_TRAVERSAL_DEPTH if max_depth is None else max_depth
+        max_nodes = MAX_VISITED_NODES if max_nodes is None else max_nodes
         start = _normalize_path(file_path)
         visited: set[str] = set()
         paths_to: dict[str, list[str]] = {}
@@ -131,16 +150,24 @@ class DependencyGraph:
 
             if depth < max_depth:
                 for nxt in sorted(self.reverse.get(current, set())):
-                    if nxt not in visited and nxt != start and len(visited) + len(queue) < max_nodes:
+                    if nxt in visited or nxt == start:
+                        continue
+                    if len(visited) + len(queue) < max_nodes:
                         queue.append((nxt, depth + 1, path + [nxt]))
+                    else:
+                        self.truncated_traversals.add(start)
+            elif any(n not in visited and n != start for n in self.reverse.get(current, set())):
+                self.truncated_traversals.add(start)
 
+        if queue:
+            self.truncated_traversals.add(start)
         return visited, paths_to
 
     def get_transitive_dependencies(
         self,
         file_path: str,
-        max_depth: int = MAX_TRAVERSAL_DEPTH,
-        max_nodes: int = MAX_VISITED_NODES,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
     ) -> set[str]:
         """Return all local files that file_path transitively imports."""
         dependencies, _ = self.get_transitive_dependencies_with_paths(file_path, max_depth, max_nodes)
@@ -149,14 +176,16 @@ class DependencyGraph:
     def get_transitive_dependencies_with_paths(
         self,
         file_path: str,
-        max_depth: int = MAX_TRAVERSAL_DEPTH,
-        max_nodes: int = MAX_VISITED_NODES,
+        max_depth: int | None = None,
+        max_nodes: int | None = None,
     ) -> tuple[set[str], dict[str, list[str]]]:
         """Return transitive dependencies and the shortest import chain leading to each.
 
         Returns:
             A tuple of (set of dependency file paths, mapping of dependency -> [chain of files]).
         """
+        max_depth = MAX_TRAVERSAL_DEPTH if max_depth is None else max_depth
+        max_nodes = MAX_VISITED_NODES if max_nodes is None else max_nodes
         start = _normalize_path(file_path)
         visited: set[str] = set()
         paths_to: dict[str, list[str]] = {}
@@ -471,15 +500,10 @@ def find_local_python_files(root: Path, excluded_dirs: frozenset[str] = DEFAULT_
         if any(part in excluded_dirs for part in rel.parts[:-1]):
             continue
 
-        # Reject out-of-root symlinks
-        if entry.is_symlink():
-            try:
-                target = entry.resolve()
-                target.relative_to(root_resolved)
-            except (ValueError, OSError):
-                continue
-
-        if entry.is_file():
+        # Out-of-root symlinks are still returned: build_local_dependency_graph refuses to
+        # read them but must RECORD that a file was skipped (a silent skip would look like
+        # complete analysis). They are never parsed.
+        if entry.is_file() or entry.is_symlink():
             python_files.append(entry)
 
     return python_files
@@ -512,6 +536,7 @@ def build_local_dependency_graph(
                 target.relative_to(root_resolved)
             except (ValueError, OSError):
                 graph.uncertainties.append(f"Symlink escapes project root: {rel_file}")
+                graph._note_incomplete(rel_file, "UNPARSEABLE", "symlink escapes project root; content not analyzed")
                 continue
 
         # Size check (2 MiB limit)
@@ -521,11 +546,13 @@ def build_local_dependency_graph(
                 err_msg = f"File exceeds maximum size limit of 2 MiB ({file_stat.st_size} bytes)"
                 graph.parse_errors[rel_file] = err_msg
                 graph.uncertainties.append(f"{rel_file}: {err_msg}")
+                graph._note_incomplete(rel_file, "UNPARSEABLE", err_msg)
                 continue
         except OSError as exc:
             err_msg = f"OSError accessing file: {type(exc).__name__}: {exc}"
             graph.parse_errors[rel_file] = err_msg
             graph.uncertainties.append(f"{rel_file}: {err_msg}")
+            graph._note_incomplete(rel_file, "UNPARSEABLE", err_msg)
             continue
 
         # Read and parse AST
@@ -536,16 +563,19 @@ def build_local_dependency_graph(
             err_msg = f"SyntaxError at line {exc.lineno}: {exc.msg}"
             graph.parse_errors[rel_file] = err_msg
             graph.uncertainties.append(f"{rel_file}: {err_msg}")
+            graph._note_incomplete(rel_file, "UNPARSEABLE", err_msg)
             continue
         except UnicodeDecodeError as exc:
             err_msg = f"UnicodeDecodeError: {exc.reason}"
             graph.parse_errors[rel_file] = err_msg
             graph.uncertainties.append(f"{rel_file}: {err_msg}")
+            graph._note_incomplete(rel_file, "UNPARSEABLE", err_msg)
             continue
         except OSError as exc:
             err_msg = f"OSError reading file: {type(exc).__name__}: {exc}"
             graph.parse_errors[rel_file] = err_msg
             graph.uncertainties.append(f"{rel_file}: {err_msg}")
+            graph._note_incomplete(rel_file, "UNPARSEABLE", err_msg)
             continue
 
         graph.parsed_files.add(rel_file)
@@ -558,6 +588,7 @@ def build_local_dependency_graph(
             graph.dynamic_import_warnings[rel_file] = visitor.dynamic_warnings
             for warn in visitor.dynamic_warnings:
                 graph.uncertainties.append(f"{rel_file}: {warn}")
+                graph._note_incomplete(rel_file, "DYNAMIC_IMPORT", warn)
 
         # Resolve each import
         file_resolved_imports: list[ResolvedImport] = []
@@ -568,6 +599,7 @@ def build_local_dependency_graph(
                 resolved_list = _resolve_absolute_import(root_resolved, rel_file, record)
 
             for item in resolved_list:
+                item = replace(item, imported_names=tuple(record.imported_names))
                 file_resolved_imports.append(item)
                 if item.classification == "LOCAL" and item.target_file and item.target_file != rel_file:
                     graph.forward.setdefault(rel_file, set()).add(item.target_file)
@@ -579,6 +611,10 @@ def build_local_dependency_graph(
                 elif item.classification == "UNRESOLVED":
                     graph.uncertainties.append(
                         f"{rel_file}: Unresolved import '{item.module_name}' ({item.detail})"
+                    )
+                    graph._note_incomplete(
+                        rel_file, "UNRESOLVED_IMPORT", f"Unresolved import '{item.module_name}'",
+                        tuple(t for t in (*item.module_name.split("."), *item.imported_names) if t),
                     )
 
         graph.imports_by_file[rel_file] = file_resolved_imports

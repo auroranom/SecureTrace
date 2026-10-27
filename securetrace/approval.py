@@ -7,7 +7,8 @@ application with Compare-And-Swap (CAS) concurrency guards.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -16,13 +17,16 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import tempfile
 import time
+from collections.abc import Iterator
 from typing import Any
 import uuid
 
 from .config import project_root
 from .db import connect
+from .diff_analysis import DiffAssessment, assess_proposed_diff
 from .ledger import (
     analyze_change_impact,
     get_requirement_detail,
@@ -32,6 +36,10 @@ from .ledger import (
 )
 
 DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
+LOCK_WAIT_SECONDS = 5.0
+LOCK_STALE_SECONDS = 60.0
+# Statuses from which the standalone path may still apply a proposal.
+APPLICABLE_STATUSES = frozenset({"PENDING", "APPROVED"})
 SEVERITY_ORDER = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
@@ -56,13 +64,28 @@ class Proposal:
     dependency_coverage: str = "LOCAL_STATIC_IMPORTS"
     uncertainties: list[str] = field(default_factory=list)
     failure_reason: str = ""
+    diff_classification: str = ""
+    assessed_risk: str = ""
+    diff_evidence: list[str] = field(default_factory=list)
+    recommended_tests: list[str] = field(default_factory=list)
+    # --- Phase 3 additions (all defaulted: records written by older versions still load) ---
+    # CONFIRMED_AFFECTED | INCOMPLETE_UNKNOWN_IMPACT | COMPLETE_NO_IMPACT | NOT_ANALYZED_NO_CHANGE | "" (legacy)
+    analysis_status: str = ""
+    # Requirements that incomplete analysis could not rule out. Never merged into affected_requirements.
+    possibly_affected_requirements: list[dict[str, Any]] = field(default_factory=list)
+    unknown_impact: list[str] = field(default_factory=list)
+    # Text encoding of the on-disk original ("utf-8" or "latin-1" for non-UTF-8 files; preserved on apply).
+    encoding: str = "utf-8"
+    # Persistence failures observed while recording this proposal's lifecycle (never silently dropped).
+    audit_errors: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Proposal:
-        return cls(**data)
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 def _get_approval_secret(root: Path) -> bytes:
@@ -119,7 +142,14 @@ def resolve_project_relative_path(root: Path, file_path: str | Path) -> tuple[st
 
     Rejects directory traversal (..) and symlinks resolving outside the root.
     Returns a tuple of (project_relative_posix_path, resolved_absolute_path).
+
+    Limits: this is a check at one instant. A symlink or parent directory can be
+    swapped after it returns (TOCTOU); ``apply_proposal`` therefore re-resolves and
+    re-checks immediately before replacing, but a portable implementation cannot
+    close that window completely (see README "Filesystem threat model").
     """
+    if not str(file_path).strip() or "\x00" in str(file_path):
+        raise ValueError("Invalid file path: empty or contains a NUL byte")
     root_resolved = root.resolve()
     target_candidate = (root / file_path).resolve()
 
@@ -143,6 +173,25 @@ def _read_disk_file_bytes(path: Path) -> tuple[bytes, str]:
         return b"", ""
     raw = path.read_bytes()
     return raw, _sha256_bytes(raw)
+
+
+def detect_text_encoding(raw: bytes) -> str:
+    """UTF-8 when valid, otherwise latin-1 (a lossless byte<->str mapping, so untouched bytes survive)."""
+    try:
+        raw.decode("utf-8")
+        return "utf-8"
+    except UnicodeDecodeError:
+        return "latin-1"
+
+
+def encode_proposed(text: str, encoding: str) -> bytes:
+    try:
+        return text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"Proposed content cannot be represented in the file's existing {encoding} encoding "
+            "without altering other bytes; refusing rather than silently transcoding the file."
+        ) from exc
 
 
 def simulate_proposed_content(
@@ -169,12 +218,31 @@ def simulate_proposed_content(
         if content is None:
             raise ValueError("write operation requires 'content'")
         if append:
+            if "\r\n" in original_content and "\r\n" not in content:
+                content = content.replace("\n", "\r\n")
+            elif "\r\n" not in original_content and "\r\n" in content:
+                content = content.replace("\r\n", "\n")
             proposed_content = original_content + content
         else:
+            if "\r\n" in original_content and "\r\n" not in content:
+                crlf_content = content.replace("\n", "\r\n")
+                if crlf_content == original_content:
+                    content = crlf_content
             proposed_content = content
     elif operation == "edit":
         if target_pattern is None or replacement_pattern is None:
             raise ValueError("edit operation requires 'target_pattern' and 'replacement_pattern'")
+        if target_pattern not in original_content:
+            if "\r\n" in original_content and "\r\n" not in target_pattern:
+                crlf_target = target_pattern.replace("\n", "\r\n")
+                if crlf_target in original_content:
+                    target_pattern = crlf_target
+                    replacement_pattern = replacement_pattern.replace("\r\n", "\n").replace("\n", "\r\n")
+            elif "\r\n" not in original_content and "\r\n" in target_pattern:
+                lf_target = target_pattern.replace("\r\n", "\n")
+                if lf_target in original_content:
+                    target_pattern = lf_target
+                    replacement_pattern = replacement_pattern.replace("\r\n", "\n")
         if target_pattern not in original_content:
             raise ValueError(
                 f"Target text not found in '{target_path.name}'. Edit cannot be applied."
@@ -187,6 +255,17 @@ def simulate_proposed_content(
             raise ValueError("multi_edit operation requires at least one replacement chunk")
         proposed_content = original_content
         for chunk_target, chunk_replacement, chunk_all in multi_edits:
+            if chunk_target not in proposed_content:
+                if "\r\n" in proposed_content and "\r\n" not in chunk_target:
+                    crlf_target = chunk_target.replace("\n", "\r\n")
+                    if crlf_target in proposed_content:
+                        chunk_target = crlf_target
+                        chunk_replacement = chunk_replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+                elif "\r\n" not in proposed_content and "\r\n" in chunk_target:
+                    lf_target = chunk_target.replace("\r\n", "\n")
+                    if lf_target in proposed_content:
+                        chunk_target = lf_target
+                        chunk_replacement = chunk_replacement.replace("\r\n", "\n")
             if chunk_target not in proposed_content:
                 raise ValueError(
                     f"Target text not found in '{target_path.name}'. Edit cannot be applied."
@@ -207,8 +286,18 @@ def _proposals_dir(root: Path) -> Path:
 
 
 def save_proposal(root: Path, proposal: Proposal) -> None:
+    """Persist atomically (temp file + replace) so a concurrent reader never sees a torn record."""
     p_file = _proposals_dir(root) / f"{proposal.proposal_id}.json"
-    p_file.write_text(json.dumps(proposal.to_dict(), indent=2), encoding="utf-8")
+    fd, tmp = tempfile.mkstemp(prefix=".prop_", suffix=".tmp", dir=p_file.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(proposal.to_dict(), indent=2))
+        os.replace(tmp, p_file)
+    finally:
+        try:
+            Path(tmp).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def load_proposal(root: Path, proposal_id: str) -> Proposal | None:
@@ -224,6 +313,35 @@ def load_proposal(root: Path, proposal_id: str) -> Proposal | None:
         return None
 
 
+_IMPACT_SENTENCES = (
+    ({"authorization", "authentication"},
+     "A mistake here could let unauthorized users perform restricted actions or bypass permission checks."),
+    ({"data_protection", "cryptography"},
+     "A mistake here could expose sensitive data or weaken how it is protected."),
+    ({"input_validation", "injection"},
+     "A mistake here could let unsafe user input reach sensitive parts of the app."),
+)
+_DEFAULT_IMPACT = "A mistake here could weaken or bypass the security safeguards registered for this feature."
+_DECISION_NOTE = (
+    "> **Decide in Antigravity's approval prompt.** This message does not approve or deny anything."
+)
+
+
+def _impact_sentence(affected_requirements: list[dict[str, Any]]) -> str:
+    categories = {str(r.get("category", "other")).lower() for r in affected_requirements}
+    for wanted, sentence in _IMPACT_SENTENCES:
+        if categories & wanted:
+            return sentence
+    return _DEFAULT_IMPACT
+
+
+def _all_uncertainties(uncertainties: list[str], diff_assessment: DiffAssessment | None) -> list[str]:
+    merged = list(uncertainties)
+    if diff_assessment:
+        merged.extend(u for u in diff_assessment.uncertainties if u not in merged)
+    return merged
+
+
 def format_plain_language_warning(
     file_path: str,
     operation: str,
@@ -231,117 +349,136 @@ def format_plain_language_warning(
     inferred_dependent_files: list[str],
     dependency_coverage: str,
     uncertainties: list[str],
+    diff_assessment: DiffAssessment | None = None,
+    proposal_id: str = "",
 ) -> str:
-    """Format a deterministic 6-part plain-language security warning for nontechnical users.
+    """Compact, scannable pre-action warning (about 8-12 short lines).
 
-    Uses accessible everyday English and clearly avoids unexplained technical terms
-    such as 'AST', 'transitive dependency', 'fingerprint', or 'stale evidence'.
+    The full analysis (evidence, dependencies, uncertainties) is not repeated here; it is
+    produced by :func:`format_warning_details` and stored on the recorded proposal.
     """
-    lines: list[str] = []
-    lines.append("### SecureTrace Pre-Action Security Warning\n")
-
-    # Part 1: What is proposed to change
-    op_desc = {
-        "edit": "replacing text",
-        "multi_edit": "replacing several pieces of text",
-    }.get(operation, "updating file content")
-    lines.append(f"**1. What is proposed to change:**")
-    lines.append(f"The AI coding agent proposes to modify `{file_path}` ({op_desc}).\n")
-
-    # Part 2: What could go wrong in everyday language
-    lines.append(f"**2. What could go wrong:**")
-    categories = {req.get("category", "other").lower() for req in affected_requirements}
-    risk_descriptions: list[str] = []
-    if "authorization" in categories or "authentication" in categories:
-        risk_descriptions.append(
-            "If this change contains a mistake, it could allow unauthorized users to perform restricted actions, access private accounts, or bypass permission checks."
-        )
-    if "data_protection" in categories or "cryptography" in categories:
-        risk_descriptions.append(
-            "If this change contains a mistake, it could expose sensitive private data or weaken how confidential information is protected."
-        )
-    if "input_validation" in categories or "injection" in categories:
-        risk_descriptions.append(
-            "If this change contains a mistake, it could allow unsafe or unvalidated user input to reach sensitive parts of the application."
-        )
-    if not risk_descriptions:
-        risk_descriptions.append(
-            "If this change contains a mistake, it could weaken or bypass the security safeguards registered for this feature."
-        )
-
-    for desc in risk_descriptions:
-        lines.append(desc)
-    lines.append(
-        "*(Note: This warning indicates a potential security risk requiring review. It does not mean a vulnerability has been found, "
-        "and it does not mean the requirement has already been violated. The file is linked to the requirement, "
-        "so a mistake here could affect it.)*\n"
+    risk = (diff_assessment.assessed_risk if diff_assessment and diff_assessment.assessed_risk else "UNCERTAIN").upper()
+    top = max(
+        (str(r.get("severity", "medium")).lower() for r in affected_requirements),
+        key=lambda sev: SEVERITY_ORDER.get(sev, 2), default="medium",
     )
+    prominent = risk in {"HIGH", "CRITICAL"} or top in {"high", "critical"}
+    heading = "### \u26a0\ufe0f SecureTrace: review required"
+    if risk in {"HIGH", "CRITICAL"}:
+        heading = f"### \U0001f6a8 SecureTrace: {risk} RISK change \u2014 review required"
 
-    # Part 3: Which registered security requirement triggered the warning and why
-    lines.append(f"**3. Why this warning appeared:**")
-    lines.append("This modification touches code protected by registered project security requirements:")
+    lines = [heading, f"**File:** `{file_path}`"]
+    classification = diff_assessment.classification if diff_assessment and diff_assessment.classification else "UNCERTAIN"
+    risk_text = f"**{risk}**" if prominent and risk in {"HIGH", "CRITICAL"} else risk
+    lines.append(f"**Change:** {classification} \u00b7 **Assessed risk:** {risk_text}")
     for req in affected_requirements:
         req_id = req.get("id") or req.get("requirement_id", "UNKNOWN")
-        title = req.get("title", "Security Requirement")
-        severity = req.get("severity", "medium").upper()
-        req_changed_files = req.get("changed_files", [])
-        if file_path in req_changed_files:
-            lines.append(f"- **{req_id}** (Severity: {severity}): \"{title}\" — `{file_path}` is directly linked to this requirement.")
-        else:
-            lines.append(f"- **{req_id}** (Severity: {severity}): \"{title}\" — This requirement relies on code that imports `{file_path}`. Changes here could indirectly affect that protected feature.")
-        description = (req.get("description") or "").strip()
-        if description:
-            lines.append(f"  - What the requirement says: {description}")
-        if req_changed_files:
-            lines.append("  - Linked files this change reaches (directly or through imports): " + ", ".join(f"`{f}`" for f in req_changed_files))
-        status = req.get("status")
-        if status:
-            lines.append(f"  - Its current recorded status: {status}")
-    lines.append("")
+        sev = str(req.get("severity", "medium")).upper()
+        lines.append(f"**Requirement:** {req_id} \u2014 \"{req.get('title', 'Security Requirement')}\" ({sev} severity)")
+    lines.append(f"**Impact:** {_impact_sentence(affected_requirements)}")
+    if diff_assessment and diff_assessment.recommended_tests:
+        lines.append("**Verify with:** " + ", ".join(f"`{t}`" for t in diff_assessment.recommended_tests))
+    statuses = sorted({str(r["status"]) for r in affected_requirements if r.get("status")})
+    if statuses:
+        lines.append(f"**Evidence status:** {', '.join(statuses)}")
+    lines.append(_DECISION_NOTE)
+    note = "> Details" + (f" for `{proposal_id}`" if proposal_id else "") + " are in SecureTrace's recorded proposal/report"
+    if proposal_id:
+        note += f" (`securetrace review {proposal_id}`)"
+    if dependency_coverage == "PARTIAL_LOCAL_STATIC" or _all_uncertainties(uncertainties, diff_assessment):
+        note += "; analysis was partial, so treat this as a minimum, not a guarantee"
+    lines.append(note + ".")
+    return "\n".join(lines)
 
-    # Part 4: How serious the potential impact is
-    lines.append(f"**4. How serious this potential impact is:**")
-    max_severity_val = 0
-    max_severity_name = "MEDIUM"
-    for req in affected_requirements:
-        sev = req.get("severity", "medium").lower()
-        val = SEVERITY_ORDER.get(sev, 2)
-        if val > max_severity_val:
-            max_severity_val = val
-            max_severity_name = sev.upper()
 
-    lines.append(f"- **Highest Registered Severity:** {max_severity_name}")
-    lines.append(f"- **Scope of Impact:** {len(affected_requirements)} registered security requirement(s) potentially affected.")
-    if inferred_dependent_files:
-        lines.append(f"- **Dependent Application Files:** {len(inferred_dependent_files)} other local file(s) rely on this code.")
-    lines.append("*(Severity is derived directly from the registered requirements in your project ledger; it has not been invented.)*\n")
-
-    # Part 5: What you can choose to do
-    lines.append(f"**5. What you can choose to do:**")
-    lines.append("- **Allow / Approve:** Permit the change if you have inspected the proposed modification and confirmed it is safe and intentional.")
-    lines.append("- **Deny / Abort:** Stop the change if you did not expect this file to be modified or want to review the code with your team first.")
-    ids = ", ".join(str(r.get("id") or r.get("requirement_id", "")) for r in affected_requirements)
+def format_warning_details(proposal: "Proposal") -> str:
+    """Expanded details for a recorded proposal: evidence, dependencies, uncertainties, recommendations."""
+    lines = [f"### SecureTrace details for {proposal.proposal_id}", f"**File:** `{proposal.file_path}` ({proposal.operation})"]
+    if proposal.diff_classification or proposal.assessed_risk:
+        lines.append(f"**Change:** {proposal.diff_classification or 'UNCERTAIN'} \u00b7 **Assessed risk:** {proposal.assessed_risk or 'UNCERTAIN'}")
+    for req in proposal.affected_requirements:
+        rid = req.get("id") or req.get("requirement_id", "UNKNOWN")
+        lines.append(f"\n**{rid}** \u2014 \"{req.get('title', '')}\" ({str(req.get('severity', 'medium')).upper()}, status {req.get('status', 'unknown')})")
+        if req.get("description"):
+            lines.append(f"- Requirement: {req['description'].strip()}")
+        if req.get("changed_files"):
+            lines.append("- Linked files reached: " + ", ".join(f"`{f}`" for f in req["changed_files"]))
+        direct = proposal.file_path in req.get("changed_files", [])
+        lines.append("- Link: " + ("this file is directly linked." if direct else f"relies on code that imports `{proposal.file_path}` (indirect)."))
+    for req in proposal.possibly_affected_requirements:
+        lines.append(f"\n**{req.get('id')}** \u2014 \"{req.get('title', '')}\" could not be ruled out.")
+    if proposal.diff_evidence:
+        lines.append("\n**Evidence:**")
+        lines.extend(f"- {e}" for e in proposal.diff_evidence)
+    if proposal.recommended_tests:
+        lines.append("\n**Recommended verification tests:**")
+        lines.extend(f"- `{t}`" for t in proposal.recommended_tests)
+    if proposal.inferred_dependent_files:
+        lines.append(f"\n**Dependent local files ({len(proposal.inferred_dependent_files)}):** " + ", ".join(f"`{f}`" for f in proposal.inferred_dependent_files))
+    if proposal.unknown_impact:
+        lines.append("\n**Could not analyze:**")
+        lines.extend(f"- {u}" for u in proposal.unknown_impact)
+    lines.append(f"\n**Dependency coverage:** {proposal.dependency_coverage}")
+    if proposal.uncertainties:
+        lines.extend(f"- {u}" for u in proposal.uncertainties)
     lines.append(
-        f"- **Try another approach:** Choose Deny, then tell the agent to propose a different change that keeps {ids} intact. "
-        "SecureTrace can only ask the agent's tool for an approve-or-deny prompt, so this step is a message you send. "
-        "The new proposal is checked again automatically before anything is written.\n"
+        "\n> [!NOTE]\n> This is a potential-risk review, not a finding of a vulnerability. Static analysis is limited: "
+        "it cannot see every way code reaches other code, and passing tests do not prove the app is secure."
     )
+    lines.append("> If approved, SecureTrace marks the affected requirements' verification evidence as outdated; "
+                 "if denied, the file is not modified.")
+    return "\n".join(lines)
 
-    # Part 6: What happens after your decision
-    lines.append(f"**6. What happens after your decision:**")
-    lines.append(f"- **If you approve:** The change will be applied to `{file_path}`. SecureTrace will immediately mark the verification records for the affected requirements as outdated, and you should run your verification tests to confirm the application remains safe.")
-    lines.append(f"- **If you deny:** The change is discarded. `{file_path}` will not be modified, and your repository remains completely untouched.\n")
 
-    # Incomplete dependency analysis disclosure if applicable
-    if dependency_coverage == "PARTIAL_LOCAL_STATIC" or uncertainties:
+def format_uncertain_impact_warning(
+    file_path: str,
+    operation: str,
+    possibly_affected: list[dict[str, Any]],
+    unknown_impact: list[str],
+    diff_assessment: DiffAssessment | None = None,
+    proposal_id: str = "",
+) -> str:
+    """Compact warning for INCOMPLETE_UNKNOWN_IMPACT.
+
+    Deliberately says "could not rule out", never "affects": no requirement has been
+    shown to be affected, but SecureTrace also cannot show that none is.
+    """
+    lines = ["### \u26a0\ufe0f SecureTrace: review required (impact could not be determined)", f"**File:** `{file_path}`"]
+    if diff_assessment and diff_assessment.classification:
+        lines.append(f"**Change:** {diff_assessment.classification} \u00b7 **Assessed risk:** {diff_assessment.assessed_risk or 'UNCERTAIN'}")
+    for req in possibly_affected:
         lines.append(
-            "> [!NOTE]\n"
-            "> **Notice on Analysis Scope:** SecureTrace could not check every possible dependency in this project "
-            "(for example, dynamic imports or non-standard file structures were encountered). "
-            "Additional parts of the application might depend on this code beyond those listed above."
+            f"**Could not rule out:** {req.get('id')} \u2014 \"{req.get('title', 'Security Requirement')}\" "
+            f"({str(req.get('severity', 'medium')).upper()} severity)"
         )
+    lines.append("**Why:** SecureTrace could not finish checking what depends on this file. This is not a finding that anything is wrong.")
+    if diff_assessment and diff_assessment.recommended_tests:
+        lines.append("**Verify with:** " + ", ".join(f"`{t}`" for t in diff_assessment.recommended_tests))
+    lines.append(_DECISION_NOTE)
+    note = "> Not analyzed: " + (unknown_impact[0] if unknown_impact else "see details")
+    if len(unknown_impact) > 1:
+        note += f" (+{len(unknown_impact) - 1} more)"
+    if proposal_id:
+        note += f". Details: `securetrace review {proposal_id}`"
+    lines.append(note)
+    return "\n".join(lines)
 
-    return "\n".join(lines).strip()
+
+def _enrich_requirement(root: Path, req_id: str, item: dict[str, Any] | None = None) -> dict[str, Any]:
+    item = item or {}
+    detail = get_requirement_detail(root, req_id) or {}
+    return {
+        "id": req_id,
+        "requirement_id": req_id,
+        "title": detail.get("title", "Security Requirement"),
+        "description": detail.get("description", ""),
+        "linked_files": detail.get("file_paths", []),
+        "category": detail.get("category", "other"),
+        "severity": detail.get("severity", "medium"),
+        "status": detail.get("status", "IDENTIFIED"),
+        "changed_files": item.get("changed_files", []),
+        "dependency_chains": item.get("dependency_chains", []),
+    }
 
 
 def evaluate_proposal(
@@ -358,16 +495,25 @@ def evaluate_proposal(
 ) -> Proposal:
     """Evaluate a proposed file modification prospectively without modifying files.
 
-    Performs containment checks, computes in-memory prospective content, runs
-    impact analysis against registered requirements, and determines whether
-    explicit user approval is required.
+    Decision policy (one place, used by both the hook and the standalone path):
+
+    * CONFIRMED_AFFECTED   - a registered requirement is linked directly or via known
+      imports -> ``FORCE_ASK`` with the full warning.
+    * INCOMPLETE_UNKNOWN_IMPACT - nothing confirmed, but dependency analysis was
+      incomplete in a way that could hide a requirement (see ledger._unknown_impact)
+      -> ``FORCE_ASK``; ``possibly_affected_requirements`` names what could not be ruled out.
+    * COMPLETE_NO_IMPACT   - analysis was sufficient and nothing is affected -> ``ALLOW``.
+
+    Evaluation errors (unreadable ledger, analysis exception, unparseable request)
+    propagate as exceptions; callers must treat them as fail-closed.
     """
     rel_path, target_resolved = resolve_project_relative_path(root, file_path)
     proposal_id = f"PROP-{uuid.uuid4().hex[:12].upper()}"
     now = time.time()
     expires_at = now + timeout_seconds
 
-    # Read original content and simulate proposed content with exact binary hash
+    raw_bytes, _ = _read_disk_file_bytes(target_resolved)
+    encoding = detect_text_encoding(raw_bytes)
     original_content, proposed_content, original_hash = simulate_proposed_content(
         target_path=target_resolved,
         operation=operation,
@@ -378,236 +524,299 @@ def evaluate_proposal(
         replace_all=replace_all,
         multi_edits=multi_edits,
     )
+    proposed_hash = _sha256_bytes(encode_proposed(proposed_content, encoding))
+    token = compute_approval_token(root, proposal_id, target_resolved.as_posix(), original_hash, proposed_hash, expires_at)
 
-    proposed_hash = _sha256_bytes(proposed_content.encode("utf-8"))
+    def build(**overrides: Any) -> Proposal:
+        base: dict[str, Any] = dict(
+            proposal_id=proposal_id, file_path=rel_path, canonical_path=target_resolved.as_posix(),
+            operation=operation, original_hash=original_hash, proposed_hash=proposed_hash,
+            proposed_content=proposed_content, created_at=now, expires_at=expires_at, token=token,
+            encoding=encoding,
+        )
+        base.update(overrides)
+        return Proposal(**base)
 
-    # If content does not change at all, allow without friction
     if original_hash and original_hash == proposed_hash:
-        token = compute_approval_token(root, proposal_id, target_resolved.as_posix(), original_hash, proposed_hash, expires_at)
-        proposal = Proposal(
-            proposal_id=proposal_id,
-            file_path=rel_path,
-            canonical_path=target_resolved.as_posix(),
-            operation=operation,
-            original_hash=original_hash,
-            proposed_hash=proposed_hash,
-            proposed_content=proposed_content,
-            created_at=now,
-            expires_at=expires_at,
-            decision="ALLOW",
-            status="APPROVED",
-            token=token,
-            warning_text="No substantive changes proposed.",
-            affected_requirements=[],
-            inferred_dependent_files=[],
-            dependency_coverage="LOCAL_STATIC_IMPORTS",
-            uncertainties=[],
+        proposal = build(
+            decision="ALLOW", status="APPROVED", warning_text="No substantive changes proposed.",
+            analysis_status="NOT_ANALYZED_NO_CHANGE",
         )
         save_proposal(root, proposal)
         return proposal
 
-    # Run change-impact analysis for this file path
     impact = analyze_change_impact(root, [rel_path])
-    raw_reqs = impact.get("requirements", [])
     inferred_deps = impact.get("inferred_dependent_files", [])
     coverage = impact.get("dependency_coverage", "LOCAL_STATIC_IMPORTS")
     uncertainties = [u.get("uncertainty", "") for u in impact.get("uncertainties", []) if isinstance(u, dict) and u.get("uncertainty")]
+    determination = impact.get("impact_determination")
+    if determination is None:  # defensive: an analyzer that does not report completeness is not "complete"
+        determination = "CONFIRMED_AFFECTED" if impact.get("requirements") else "INCOMPLETE_UNKNOWN_IMPACT"
 
-    # Enrich affected requirements with full metadata from ledger
-    affected_reqs: list[dict[str, Any]] = []
-    for item in raw_reqs:
-        req_id = item.get("requirement_id")
-        detail = get_requirement_detail(root, req_id) or {}
-        enriched = {
-            "id": req_id,
-            "requirement_id": req_id,
-            "title": detail.get("title", "Security Requirement"),
-            "description": detail.get("description", ""),
-            "linked_files": detail.get("file_paths", []),
-            "category": detail.get("category", "other"),
-            "severity": detail.get("severity", "medium"),
-            "status": detail.get("status", "IDENTIFIED"),
-            "changed_files": item.get("changed_files", []),
-            "dependency_chains": item.get("dependency_chains", []),
-        }
-        affected_reqs.append(enriched)
+    affected_reqs = [_enrich_requirement(root, item.get("requirement_id"), item) for item in impact.get("requirements", [])]
+    unknown_items = impact.get("unknown_impact", [])
+    possible_ids = sorted({rid for u in unknown_items for rid in u.get("requirement_ids", [])} - {r["id"] for r in affected_reqs})
+    possible_reqs = [_enrich_requirement(root, rid) for rid in possible_ids]
+    unknown_text = [u.get("detail", "") for u in unknown_items if u.get("detail")]
 
-    # If any registered security requirement is affected (directly or via dependencies)
+    diff_assessment = assess_proposed_diff(
+        original_content=original_content, proposed_content=proposed_content, file_path=rel_path,
+        affected_requirements=affected_reqs or possible_reqs, root=root,
+    )
+    common = dict(
+        inferred_dependent_files=inferred_deps, dependency_coverage=coverage, uncertainties=uncertainties,
+        diff_classification=diff_assessment.classification, assessed_risk=diff_assessment.assessed_risk,
+        diff_evidence=diff_assessment.evidence, recommended_tests=diff_assessment.recommended_tests,
+        possibly_affected_requirements=possible_reqs, unknown_impact=unknown_text,
+    )
+
     if affected_reqs:
         warning = format_plain_language_warning(
-            file_path=rel_path,
-            operation=operation,
-            affected_requirements=affected_reqs,
-            inferred_dependent_files=inferred_deps,
-            dependency_coverage=coverage,
-            uncertainties=uncertainties,
+            file_path=rel_path, operation=operation, affected_requirements=affected_reqs,
+            inferred_dependent_files=inferred_deps, dependency_coverage=coverage,
+            uncertainties=uncertainties, diff_assessment=diff_assessment, proposal_id=proposal_id,
         )
-        token = compute_approval_token(root, proposal_id, target_resolved.as_posix(), original_hash, proposed_hash, expires_at)
-        proposal = Proposal(
-            proposal_id=proposal_id,
-            file_path=rel_path,
-            canonical_path=target_resolved.as_posix(),
-            operation=operation,
-            original_hash=original_hash,
-            proposed_hash=proposed_hash,
-            proposed_content=proposed_content,
-            created_at=now,
-            expires_at=expires_at,
-            decision="FORCE_ASK",
-            status="PENDING",
-            token=token,
-            warning_text=warning,
-            affected_requirements=affected_reqs,
-            inferred_dependent_files=inferred_deps,
-            dependency_coverage=coverage,
-            uncertainties=uncertainties,
+        proposal = build(
+            decision="FORCE_ASK", status="PENDING", warning_text=warning,
+            affected_requirements=affected_reqs, analysis_status="CONFIRMED_AFFECTED", **common,
+        )
+    elif determination == "INCOMPLETE_UNKNOWN_IMPACT":
+        warning = format_uncertain_impact_warning(rel_path, operation, possible_reqs, unknown_text, diff_assessment, proposal_id)
+        proposal = build(
+            decision="FORCE_ASK", status="PENDING", warning_text=warning,
+            affected_requirements=[], analysis_status="INCOMPLETE_UNKNOWN_IMPACT", **common,
         )
     else:
-        # No security requirements affected: safe documented policy
-        token = compute_approval_token(root, proposal_id, target_resolved.as_posix(), original_hash, proposed_hash, expires_at)
-        proposal = Proposal(
-            proposal_id=proposal_id,
-            file_path=rel_path,
-            canonical_path=target_resolved.as_posix(),
-            operation=operation,
-            original_hash=original_hash,
-            proposed_hash=proposed_hash,
-            proposed_content=proposed_content,
-            created_at=now,
-            expires_at=expires_at,
-            decision="ALLOW",
-            status="APPROVED",
-            token=token,
-            warning_text="No registered security requirements affected.",
-            affected_requirements=[],
-            inferred_dependent_files=inferred_deps,
-            dependency_coverage=coverage,
-            uncertainties=uncertainties,
+        proposal = build(
+            decision="ALLOW", status="APPROVED", warning_text="No registered security requirements affected.",
+            affected_requirements=[], analysis_status="COMPLETE_NO_IMPACT", **common,
         )
 
     save_proposal(root, proposal)
     return proposal
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle helpers: locking, audit recording, diagnostics
+# ---------------------------------------------------------------------------
+
+def log_diagnostic(root: Path, component: str, message: str) -> None:
+    """Best-effort append to .securetrace/diagnostics.log (never raises, never records file contents)."""
+    try:
+        d = root / ".securetrace"
+        d.mkdir(parents=True, exist_ok=True)
+        line = json.dumps({"ts": now_iso(), "component": component, "message": str(message)[:500]})
+        with open(d / "diagnostics.log", "a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+    except OSError:
+        pass
+
+
+@contextmanager
+def _exclusive_lock(root: Path, name: str) -> Iterator[None]:
+    """Cross-process advisory lock via O_EXCL lock file (portable: POSIX and Windows).
+
+    Serializes the check-then-replace window for one target between SecureTrace
+    processes only. It does NOT stop other programs (editors, shells, the host)
+    from writing the file; the compare-and-swap hash check covers those.
+    A lock older than LOCK_STALE_SECONDS is treated as left by a crashed process.
+    """
+    lock_dir = root / ".securetrace" / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{hashlib.sha256(name.encode()).hexdigest()[:24]}.lock"
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()} {time.time()}".encode())
+            os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SECONDS:
+                    lock_path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise ValueError("Another SecureTrace operation holds the lock for this file; try again.")
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _record_lifecycle_event(root: Path, proposal: Proposal, event_type: str, details: str) -> None:
+    """Record one event per affected/possibly-affected requirement (or one unattached event).
+
+    Failures are appended to ``proposal.audit_errors`` and the diagnostics log; the
+    caller decides how to surface them. Nothing here may change a completed file operation.
+    """
+    reqs = proposal.affected_requirements or proposal.possibly_affected_requirements
+    targets = [r.get("id") for r in reqs] or [None]
+    for req_id in targets:
+        try:
+            record_event(root, req_id, event_type, details)
+        except Exception as exc:  # noqa: BLE001 - recorded and surfaced, not hidden
+            msg = f"{event_type} not recorded for {req_id or 'no requirement'}: {type(exc).__name__}: {exc}"
+            proposal.audit_errors.append(msg)
+            log_diagnostic(root, "approval", msg)
+
+
+def _persist_proposal(root: Path, proposal: Proposal) -> None:
+    try:
+        save_proposal(root, proposal)
+    except OSError as exc:
+        msg = f"proposal state for {proposal.proposal_id} not persisted: {type(exc).__name__}: {exc}"
+        proposal.audit_errors.append(msg)
+        log_diagnostic(root, "approval", msg)
 
 
 def deny_proposal(root: Path, proposal_id: str) -> Proposal:
-    """Explicitly deny/abort a proposal. Leaves the target file untouched."""
-    proposal = load_proposal(root, proposal_id)
-    if not proposal:
-        raise ValueError(f"Proposal '{proposal_id}' not found")
-    if proposal.status == "APPLIED":
-        raise ValueError(f"Proposal '{proposal_id}' has already been applied and cannot be denied")
+    """Record an explicit denial made through SecureTrace (CLI/MCP). Leaves the target untouched.
 
-    proposal.status = "DENIED"
-    save_proposal(root, proposal)
-
-    # Record event in ledger
-    timestamp = now_iso()
-    try:
-        with connect(root) as db:
-            db.execute(
-                "INSERT INTO events(requirement_id, event_type, details, created_at) VALUES (?, ?, ?, ?)",
-                (
-                    proposal.affected_requirements[0].get("id") if proposal.affected_requirements else None,
-                    "APPROVAL_DENIED",
-                    f"Proposal {proposal_id} for {proposal.file_path} was denied by user.",
-                    timestamp,
-                ),
-            )
-    except Exception:
-        pass
-
-    return proposal
-
-
-def apply_proposal(
-    root: Path,
-    proposal_id: str,
-    token: str,
-) -> Proposal:
-    """Apply an approved proposal to disk with atomic swap and CAS validation.
-
-    Enforces:
-    1. Valid HMAC token binding proposal, target, and prospective content.
-    2. Expiry check (fails closed if expired).
-    3. Single-use replay protection (cannot re-apply an already applied proposal).
-    4. Status check (must not be DENIED).
-    5. Compare-And-Swap (CAS) guard: target file on disk must match original_hash.
-    6. Atomic file write via temporary sibling file and os.replace.
-    7. Updates ledger to mark affected requirements as STALE.
+    This is the only place ``DENIED`` is produced. It is NOT inferred from expiry or from
+    a missing write, and it is not a statement about what the host/user did in the IDE.
+    Idempotent: denying an already-denied proposal records nothing new.
     """
     proposal = load_proposal(root, proposal_id)
     if not proposal:
         raise ValueError(f"Proposal '{proposal_id}' not found")
+    if proposal.status in {"APPLIED", "APPLIED_BY_HOST"}:
+        raise ValueError(f"Proposal '{proposal_id}' has already been applied and cannot be denied")
+    if proposal.status == "DENIED":
+        return proposal
+    proposal.status = "DENIED"
+    save_proposal(root, proposal)
+    _record_lifecycle_event(
+        root, proposal, "APPROVAL_DENIED",
+        f"Proposal {proposal_id} for {proposal.file_path} was denied by user.",
+    )
+    if proposal.audit_errors:
+        _persist_proposal(root, proposal)
+    return proposal
 
-    # 1. Verify token
+
+def _reject(root: Path, proposal: Proposal, reason: str) -> ValueError:
+    """Record a refused application attempt for a known proposal and return the error to raise."""
+    _record_lifecycle_event(root, proposal, "APPROVAL_APPLY_REJECTED", f"Proposal {proposal.proposal_id}: {reason}")
+    return ValueError(reason)
+
+
+def apply_proposal(root: Path, proposal_id: str, token: str) -> Proposal:
+    """Apply an approved proposal to disk with atomic swap and CAS validation.
+
+    Enforces, in order, under a per-target lock and against a fresh read of the record:
+    HMAC token; proposal content bound to ``proposed_hash``; target identity bound to
+    ``canonical_path``; single-use (replay) and status; expiry; compare-and-swap on the
+    original hash (re-checked immediately before the replace); atomic temp-file replace
+    preserving permissions and the file's original encoding.
+
+    Post-write bookkeeping (state save, freshness, audit events) cannot undo a write that
+    already happened, so failures there do not raise; they are returned in
+    ``proposal.audit_errors`` and logged to diagnostics.log. Callers must display them.
+    """
+    proposal = load_proposal(root, proposal_id)
+    if not proposal:
+        raise ValueError(f"Proposal '{proposal_id}' not found")
     if not verify_approval_token(root, proposal, token):
         raise ValueError("Invalid approval token: signature mismatch or tampered proposal")
 
-    # 2. Check replay
-    if proposal.status == "APPLIED":
-        raise ValueError(f"Replay rejected: proposal '{proposal_id}' has already been applied")
-
-    # 3. Check denial
-    if proposal.status == "DENIED":
-        raise ValueError(f"Cannot apply proposal '{proposal_id}': proposal was denied")
-
-    # 4. Check expiry
-    if time.time() > proposal.expires_at:
-        proposal.status = "EXPIRED"
-        save_proposal(root, proposal)
-        raise ValueError(f"Proposal '{proposal_id}' has expired. Re-review required.")
-
-    # 5. Validate path containment
     _, target_resolved = resolve_project_relative_path(root, proposal.file_path)
+    with _exclusive_lock(root, proposal.canonical_path):
+        proposal = load_proposal(root, proposal_id) or proposal   # fresh state inside the lock
+        if proposal.status == "APPLIED":
+            raise _reject(root, proposal, f"Replay rejected: proposal '{proposal_id}' has already been applied")
+        if proposal.status == "APPLIED_BY_HOST":
+            raise _reject(root, proposal, f"Proposal '{proposal_id}' was already observed as written by the host")
+        if proposal.status == "DENIED":
+            raise _reject(root, proposal, f"Cannot apply proposal '{proposal_id}': proposal was denied")
+        if time.time() > proposal.expires_at:
+            if proposal.status != "EXPIRED":
+                proposal.status = "EXPIRED"
+                save_proposal(root, proposal)
+                _record_lifecycle_event(
+                    root, proposal, "APPROVAL_EXPIRED",
+                    f"Proposal {proposal_id} for {proposal.file_path} expired before it was applied through SecureTrace. "
+                    "Expiry is not a denial.",
+                )
+            raise ValueError(f"Proposal '{proposal_id}' has expired. Re-review required.")
+        if proposal.status not in APPLICABLE_STATUSES:
+            raise _reject(root, proposal, f"Proposal '{proposal_id}' has status {proposal.status} and cannot be applied")
 
-    # 6. Compare-And-Swap (CAS) concurrency guard
-    _, current_disk_hash = _read_disk_file_bytes(target_resolved)
-    if current_disk_hash != proposal.original_hash:
-        raise ValueError(
-            f"Concurrent modification detected: '{proposal.file_path}' changed on disk since review "
-            f"(expected SHA-256 {proposal.original_hash or 'EMPTY'}, found {current_disk_hash or 'EMPTY'}). "
-            f"Overwriting is blocked."
-        )
-
-    # 7. Atomic file application
-    target_dir = target_resolved.parent
-    target_dir.mkdir(parents=True, exist_ok=True)
-    fd, temp_path_str = tempfile.mkstemp(prefix=".sec_tmp_", suffix=".tmp", dir=target_dir)
-    temp_path = Path(temp_path_str)
-
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(proposal.proposed_content.encode("utf-8"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp_path, target_resolved)
-    finally:
+        # Proposal integrity: content and target identity must still be what was reviewed.
         try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            payload = encode_proposed(proposal.proposed_content, proposal.encoding or "utf-8")
+        except ValueError as exc:
+            raise _reject(root, proposal, str(exc)) from exc
+        if _sha256_bytes(payload) != proposal.proposed_hash:
+            raise _reject(root, proposal, "Proposal integrity failure: stored content does not match its reviewed hash")
+        if target_resolved.as_posix() != proposal.canonical_path:
+            raise _reject(
+                root, proposal,
+                f"Target identity changed since review: '{proposal.file_path}' now resolves elsewhere "
+                "(symlink or directory replaced). Re-review required.",
+            )
 
-    # 8. Mark proposal status as APPLIED
-    proposal.status = "APPLIED"
-    save_proposal(root, proposal)
+        def current_hash() -> str:
+            return _read_disk_file_bytes(target_resolved)[1]
 
-    # 9. Reassess freshness / mark affected requirements as STALE in ledger
-    timestamp = now_iso()
+        found = current_hash()
+        if found != proposal.original_hash:
+            raise _reject(
+                root, proposal,
+                f"Concurrent modification detected: '{proposal.file_path}' changed on disk since review "
+                f"(expected SHA-256 {proposal.original_hash or 'EMPTY'}, found {found or 'EMPTY'}). Overwriting is blocked.",
+            )
+
+        target_dir = target_resolved.parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+        fd, temp_path_str = tempfile.mkstemp(prefix=".sec_tmp_", suffix=".tmp", dir=target_dir)
+        temp_path = Path(temp_path_str)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # mkstemp creates 0600; keep the original file's mode (or a normal 0644 for new files).
+            try:
+                if target_resolved.exists():
+                    shutil.copymode(target_resolved, temp_path)
+                else:
+                    os.chmod(temp_path, 0o644)
+            except OSError as exc:
+                raise ValueError(f"Could not preserve file permissions; write aborted: {exc}") from exc
+            # Narrow the TOCTOU window: re-check path identity and content immediately before the swap.
+            _, again = resolve_project_relative_path(root, proposal.file_path)
+            if again != target_resolved or current_hash() != proposal.original_hash:
+                raise _reject(root, proposal, "Target changed between validation and write; write aborted. Re-review required.")
+            os.replace(temp_path, target_resolved)
+        finally:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        proposal.status = "APPLIED"
+        _persist_proposal(root, proposal)
+
+    # The file is written. Everything below is bookkeeping whose failure must be visible, not fatal.
     try:
         mark_changed_files(root, [proposal.file_path])
-        with connect(root) as db:
-            db.execute(
-                "INSERT INTO events(requirement_id, event_type, details, created_at) VALUES (?, ?, ?, ?)",
-                (
-                    proposal.affected_requirements[0].get("id") if proposal.affected_requirements else None,
-                    "APPROVAL_APPLIED",
-                    f"Proposal {proposal_id} applied to {proposal.file_path} (SHA-256: {proposal.proposed_hash[:10]}).",
-                    timestamp,
-                ),
-            )
-    except Exception:
-        pass
-
+    except Exception as exc:  # noqa: BLE001
+        msg = f"Evidence freshness not updated for {proposal.file_path}: {type(exc).__name__}: {exc}"
+        proposal.audit_errors.append(msg)
+        log_diagnostic(root, "approval", msg)
+    _record_lifecycle_event(
+        root, proposal, "APPROVAL_APPLIED",
+        f"Proposal {proposal_id} applied to {proposal.file_path} (SHA-256: {proposal.proposed_hash[:10]}).",
+    )
+    if proposal.audit_errors:
+        _persist_proposal(root, proposal)
     return proposal
 
 
@@ -630,38 +839,65 @@ def sweep_unresolved_reviews(root: Path, *, now: float | None = None) -> list[st
             continue
         proposal.status = "EXPIRED"
         save_proposal(root, proposal)
-        for req in proposal.affected_requirements or [{}]:
-            record_event(
-                root, req.get("id"), "REVIEW_NO_WRITE_OBSERVED",
-                f"Review {proposal.proposal_id} for {proposal.file_path} expired and no completed write matching it "
-                "was observed. The host does not report the user's decision, so this may be a denial, a cancellation, "
-                "or a failed write.",
-            )
+        _record_lifecycle_event(
+            root, proposal, "REVIEW_NO_WRITE_OBSERVED",
+            f"Review {proposal.proposal_id} for {proposal.file_path} expired and no completed write matching it "
+            "was observed. The host does not report the user's decision, so this may be a denial, a cancellation, "
+            "or a failed write.",
+        )
         closed.append(proposal.proposal_id)
     return closed
 
 
-def find_reviewed_proposal_for_write(root: Path, rel_path: str, *, now: float | None = None) -> Proposal | None:
-    """Return the pending reviewed proposal whose proposed content now matches the file on disk."""
-    now = time.time() if now is None else now
+def classify_host_write(root: Path, rel_path: str, *, now: float | None = None) -> dict[str, Any]:
+    """Relate the file now on disk to reviewed proposals for this path.
+
+    Returns ``{"state": ..., "match": Proposal|None, "candidates": [ids], "disk_hash": str}`` where state is
+      * ``MATCHED``    exactly one open proposal's proposed content equals the file on disk;
+      * ``AMBIGUOUS``  several open proposals share that proposed content (cannot tell which was reviewed);
+      * ``MISMATCH``   open proposals exist for the path but none equals what is on disk
+                       (intervening modification, or the host wrote different content than was reviewed);
+      * ``UNCHANGED``  the file still equals the original of every open proposal (nothing was written);
+      * ``ALREADY_RECORDED`` no open proposal, but this exact content was already recorded as host-applied
+                       (a duplicate post-action callback);
+      * ``NO_REVIEW``  no open proposal exists for this path.
+    "Open" means PENDING, or EXPIRED-without-write (a late approval after the review window still matches).
+    The match is by project-relative path AND the SHA-256 of the proposed bytes; the host gives no proposal ID.
+    """
     try:
         _, target = resolve_project_relative_path(root, rel_path)
     except ValueError:
-        return None
+        return {"state": "NO_REVIEW", "match": None, "candidates": [], "disk_hash": ""}
     _, disk_hash = _read_disk_file_bytes(target)
-    if not disk_hash:
-        return None
     p_dir = root / ".securetrace" / "proposals"
-    if not p_dir.is_dir():
-        return None
-    for p_file in sorted(p_dir.glob("PROP-*.json"), key=lambda f: f.stat().st_mtime, reverse=True):
-        proposal = load_proposal(root, p_file.stem)
-        if (
-            proposal is not None
-            and proposal.status == "PENDING"
-            and proposal.decision == "FORCE_ASK"
-            and proposal.file_path == rel_path
-            and proposal.proposed_hash == disk_hash
-        ):
-            return proposal
-    return None
+    open_props: list[Proposal] = []
+    recorded = False
+    if p_dir.is_dir():
+        for p_file in sorted(p_dir.glob("PROP-*.json")):
+            proposal = load_proposal(root, p_file.stem)
+            if proposal is None or proposal.decision != "FORCE_ASK" or proposal.file_path != rel_path:
+                continue
+            if proposal.status in {"PENDING", "EXPIRED"}:
+                open_props.append(proposal)
+            elif proposal.status == "APPLIED_BY_HOST" and disk_hash and proposal.proposed_hash == disk_hash:
+                recorded = True
+    if not open_props and recorded:
+        return {"state": "ALREADY_RECORDED", "match": None, "candidates": [], "disk_hash": disk_hash}
+    if not open_props:
+        return {"state": "NO_REVIEW", "match": None, "candidates": [], "disk_hash": disk_hash}
+    matches = [p for p in open_props if disk_hash and p.proposed_hash == disk_hash]
+    if len(matches) == 1:
+        return {"state": "MATCHED", "match": matches[0], "candidates": [matches[0].proposal_id], "disk_hash": disk_hash}
+    if len(matches) > 1:
+        return {"state": "AMBIGUOUS", "match": None, "candidates": [p.proposal_id for p in matches], "disk_hash": disk_hash}
+    if all(p.original_hash == disk_hash for p in open_props):
+        return {"state": "UNCHANGED", "match": None, "candidates": [p.proposal_id for p in open_props], "disk_hash": disk_hash}
+    return {"state": "MISMATCH", "match": None, "candidates": [p.proposal_id for p in open_props], "disk_hash": disk_hash}
+
+
+def find_reviewed_proposal_for_write(root: Path, rel_path: str, *, now: float | None = None) -> Proposal | None:
+    """Return the single reviewed proposal whose proposed content is now on disk, else None.
+
+    Ambiguity (several identical open proposals) returns None rather than guessing.
+    """
+    return classify_host_write(root, rel_path, now=now)["match"]

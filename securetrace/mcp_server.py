@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -144,6 +145,12 @@ def _validate_project_relative_paths(root: Path, file_paths: list[str]) -> list[
             raise ValueError("Each file path must be a non-empty string")
         if "\x00" in raw:
             raise ValueError(f"Invalid file path: {raw!r}")
+
+        # Windows drive-qualified and UNC paths are never project-relative. On POSIX they would
+        # otherwise be read as odd-but-legal relative names and pass containment, so reject them
+        # on every platform to keep ledgers portable.
+        if re.match(r"^[A-Za-z]:[\\/]", raw.strip()) or raw.strip().startswith("\\\\"):
+            raise ValueError(f"File path escapes the project root: {raw}")
 
         path_obj = Path(raw.strip())
         if path_obj.is_absolute():

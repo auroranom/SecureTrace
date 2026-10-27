@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shlex
 import shutil
 import sys
+import time
 
 HOOK_NAME = "securetrace-approval"
 # Antigravity's file-editing tools. Shell commands are deliberately not matched.
@@ -31,7 +33,14 @@ def _is_windows_path(path_str: str) -> bool:
 def _command(python_exe: str, action: str, use_wrapper: bool = False) -> str:
     if use_wrapper:
         return f"call .agents\\{WRAPPER_BAT_NAME} {action} 2>nul || call {WRAPPER_BAT_NAME} {action}"
-    exe = f'"{python_exe}"' if any(c.isspace() for c in python_exe) else python_exe
+    if _is_windows_path(python_exe):
+        # Windows: cmd.exe quoting. Paths with spaces go through the wrapper instead (see build_hook_entry).
+        exe = f'"{python_exe}"' if any(c.isspace() for c in python_exe) else python_exe
+    else:
+        if any(c in python_exe for c in '$`"\\\'!') or "\n" in python_exe:
+            exe = shlex.quote(python_exe)   # characters a POSIX shell would interpret even inside "..."
+        else:
+            exe = f'"{python_exe}"' if any(c.isspace() for c in python_exe) else python_exe
     return f"{exe} -m securetrace.hooks {action}"
 
 
@@ -60,13 +69,26 @@ def install_hooks(project_dir: Path, python_exe: str | None = None) -> Path:
     agents_dir.mkdir(parents=True, exist_ok=True)
     target = agents_dir / "hooks.json"
 
+    if not exe:
+        raise ValueError("Could not determine the Python interpreter (sys.executable is empty); pass --python.")
     use_wrapper = _is_windows_path(exe) and any(c.isspace() for c in exe)
     if use_wrapper:
-        wrapper_content = f'@"{exe}" -m securetrace.hooks %*\r\n'
-        wrapper_target = agents_dir / WRAPPER_BAT_NAME
-        wrapper_target.write_text(wrapper_content, encoding="ascii")
+        # A batch file is ASCII-only here. Rather than emit a wrapper that cmd.exe would misread
+        # (unverified code-page behaviour), refuse non-ASCII interpreter paths with a clear remedy.
         try:
-            (project_dir.resolve() / WRAPPER_BAT_NAME).write_text(wrapper_content, encoding="ascii")
+            exe.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError(
+                f"The Python path contains non-ASCII characters and contains spaces ({exe!r}); the Windows hook "
+                "wrapper cannot represent it reliably. Create the virtual environment at an ASCII path without "
+                "spaces, or pass --python with such an interpreter."
+            ) from exc
+        escaped = exe.replace("%", "%%")   # '%' would otherwise be expanded by cmd.exe
+        wrapper_content = f'@"{escaped}" -m securetrace.hooks %*\r\n'
+        wrapper_target = agents_dir / WRAPPER_BAT_NAME
+        wrapper_target.write_text(wrapper_content, encoding="ascii", newline="")
+        try:
+            (project_dir.resolve() / WRAPPER_BAT_NAME).write_text(wrapper_content, encoding="ascii", newline="")
         except OSError:
             pass
 
@@ -78,9 +100,15 @@ def install_hooks(project_dir: Path, python_exe: str | None = None) -> Path:
             raise ValueError(f"{target} is not valid JSON; fix or remove it first: {exc}") from exc
         if not isinstance(config, dict):
             raise ValueError(f"{target} must contain a JSON object")
-        shutil.copyfile(target, target.with_name("hooks.json.securetrace-backup"))
+        # Never overwrite an earlier backup: the first one holds the user's original file.
+        backup = target.with_name("hooks.json.securetrace-backup")
+        if backup.exists():
+            backup = target.with_name(f"hooks.json.securetrace-backup-{int(time.time())}")
+        shutil.copyfile(target, backup)
     config[HOOK_NAME] = build_hook_entry(exe, use_wrapper=use_wrapper)
-    target.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    tmp = target.with_name("hooks.json.tmp")
+    tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(target)   # atomic: a crash cannot leave a half-written hooks.json
     return target
 
 

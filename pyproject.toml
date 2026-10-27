@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.2.0,<2",
   "watchdog>=4.0.0",
-  "winotify>=1.1.0",
+  "winotify>=1.1.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

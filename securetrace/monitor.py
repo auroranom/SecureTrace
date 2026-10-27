@@ -9,7 +9,6 @@ from pathlib import Path
 
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
-from winotify import Notification
 
 from .ledger import list_requirements, mark_changed_files
 from .security_scanner import scan_file
@@ -39,8 +38,15 @@ def normalize_relative_path(path: str) -> str:
 
 
 def send_desktop_notification(title: str, message: str) -> None:
-    """Show a Windows desktop notification for SecureTrace."""
+    """Show a Windows desktop notification for SecureTrace.
+
+    winotify is Windows-only (it imports ``winreg``), so it is imported lazily:
+    on other platforms the notification is skipped with a stderr diagnostic
+    rather than making the whole package (CLI, MCP server, tests) unimportable.
+    """
     try:
+        from winotify import Notification
+
         Notification(
             app_id="SecureTrace",
             title=title[:100],

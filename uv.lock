@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
+    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
 ]
 
 [[package]]
@@ -797,7 +797,7 @@ source = { editable = "." }
 dependencies = [
     { name = "mcp" },
     { name = "watchdog" },
-    { name = "winotify" },
+    { name = "winotify", marker = "sys_platform == 'win32'" },
 ]
 
 [package.optional-dependencies]
@@ -817,7 +817,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.0" },
     { name = "watchdog", specifier = ">=4.0.0" },
-    { name = "winotify", specifier = ">=1.1.0" },
+    { name = "winotify", marker = "sys_platform == 'win32'", specifier = ">=1.1.0" },
 ]
 provides-extras = ["dev"]
 

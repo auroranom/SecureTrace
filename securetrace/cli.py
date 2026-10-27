@@ -19,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="Initialize the local SecureTrace database")
+    sub.add_parser("doctor", help="Read-only diagnostics for installation, ledger and hook configuration")
     sub.add_parser("migrate", help="Explicitly add the requirement-to-test mapping tables")
 
     mapping = sub.add_parser("map-test", help="Map one approved pytest function to a requirement")
@@ -119,10 +120,17 @@ def main() -> None:
     args = build_parser().parse_args()
     root = project_root()
 
+    if args.command == "doctor":
+        from .doctor import main as doctor_main
+        raise SystemExit(doctor_main(root))
+
     if args.command == "init":
+        db_file = root / ".securetrace" / "securetrace.db"
+        existed = db_file.exists()
         with connect(root):
             pass
-        print(f"Initialized SecureTrace at {root / '.securetrace' / 'securetrace.db'}")
+        print(f"{'Opened existing' if existed else 'Initialized'} SecureTrace ledger at {db_file}"
+              + (" (existing history preserved)" if existed else ""))
     elif args.command == "migrate":
         from .db import migrate_mappings
         migrate_mappings(root)
@@ -309,7 +317,7 @@ def main() -> None:
             print(f"Error starting dashboard: {exc}", file=sys.stderr)
             raise SystemExit(2)
     elif args.command == "review":
-        from .approval import load_proposal
+        from .approval import format_warning_details, load_proposal
         proposal = load_proposal(root, args.proposal_id)
         if not proposal:
             print(f"Error: Proposal '{args.proposal_id}' not found.", file=sys.stderr)
@@ -320,6 +328,8 @@ def main() -> None:
         print(f"Decision: {proposal.decision}")
         print("---")
         print(proposal.warning_text)
+        print("---")
+        print(format_warning_details(proposal))
     elif args.command == "approve":
         from .approval import apply_proposal, load_proposal
         proposal = load_proposal(root, args.proposal_id)
@@ -330,6 +340,10 @@ def main() -> None:
         try:
             applied = apply_proposal(root, args.proposal_id, token)
             print(f"Approved and applied proposal {applied.proposal_id} to {applied.file_path}")
+            for problem in applied.audit_errors:
+                print(f"WARNING (file was written, bookkeeping incomplete): {problem}", file=sys.stderr)
+            if applied.audit_errors:
+                raise SystemExit(3)
         except ValueError as exc:
             print(f"Approval error: {exc}", file=sys.stderr)
             raise SystemExit(2)

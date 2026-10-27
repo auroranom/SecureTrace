@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import re
 from pathlib import Path
 import uuid
 
@@ -31,7 +32,32 @@ def now_iso() -> str:
 
 
 def normalize_path(path: str) -> str:
-    return Path(path).as_posix().removeprefix("./")
+    """Canonical ledger spelling of a project-relative path: forward slashes, no ``./`` or ``//``.
+
+    ``..`` segments are deliberately NOT collapsed here (collapsing would hide traversal);
+    registration rejects them via validate_requirement_path. Case is preserved: on
+    case-insensitive filesystems register the path with the spelling the filesystem reports.
+    """
+    raw = str(path).strip().replace("\\", "/")
+    parts = [seg for seg in raw.split("/") if seg not in ("", ".")]
+    if raw.startswith("/"):
+        return "/" + "/".join(parts)
+    return "/".join(parts)
+
+
+def validate_requirement_path(path: str) -> str:
+    """Normalize and validate a path being linked to a requirement (must be project-relative)."""
+    raw = str(path)
+    if "\x00" in raw:
+        raise ValueError(f"Invalid file path (NUL byte): {raw!r}")
+    normalized = normalize_path(raw)
+    if not normalized:
+        raise ValueError(f"Invalid file path: {raw!r}")
+    if normalized.startswith("/") or re.match(r"^[A-Za-z]:", normalized):
+        raise ValueError(f"Requirement file paths must be project-relative, not absolute: {raw!r}")
+    if ".." in normalized.split("/"):
+        raise ValueError(f"Requirement file paths must not contain '..': {raw!r}")
+    return normalized
 
 
 def add_requirement(
@@ -51,7 +77,7 @@ def add_requirement(
 
     requirement_id = f"SEC-{uuid.uuid4().hex[:8].upper()}"
     timestamp = now_iso()
-    paths = sorted({normalize_path(p) for p in (file_paths or []) if p.strip()})
+    paths = sorted({validate_requirement_path(p) for p in (file_paths or []) if p.strip()})
 
     with connect(root) as db:
         db.execute(
@@ -287,13 +313,42 @@ def mark_changed_files(root: Path, changed_paths: list[str]) -> list[dict]:
 
         for requirement_id, paths in affected.items():
             paths[:] = sorted(set(paths))
+    # Transitive dependencies: a change to a file that a requirement-linked file (or mapped
+    # test) imports, directly or indirectly, must also invalidate that requirement's evidence.
+    graph = None
+    graph_problem: str | None = None
+    changed_py = [p for p in normalized if p.endswith(".py")]
+    if changed_py:
+        try:
+            from .dependencies import build_local_dependency_graph
+            graph = build_local_dependency_graph(root)
+        except Exception as exc:  # noqa: BLE001 - surfaced below after direct invalidation is done
+            graph_problem = f"{type(exc).__name__}: {exc}"
+    if graph is not None:
+        with connect(root) as db:
+            has_mapping = _mapping_schema_available(db)
+            for path in changed_py:
+                for dependent in sorted(graph.get_transitive_dependents(path)):
+                    for row in db.execute("SELECT requirement_id FROM requirement_files WHERE file_path = ?", (dependent,)):
+                        affected.setdefault(row["requirement_id"], []).append(path)
+                    if has_mapping:
+                        for row in db.execute("SELECT requirement_id FROM requirement_tests WHERE test_file = ?", (dependent,)):
+                            affected.setdefault(row["requirement_id"], []).append(path)
+                if path in graph.truncated_traversals:
+                    graph_problem = f"dependent traversal from {path} was truncated"
+        for paths in affected.values():
+            paths[:] = sorted(set(paths))
+
     # Recorded through the shared helper so the watcher, hooks and CLI do not
     # each write the same LINKED_FILE_CHANGED event for one save.
     for requirement_id, paths in affected.items():
         record_event(root, requirement_id, "LINKED_FILE_CHANGED",
                      f"Changed files: {', '.join(paths)}", dedupe_seconds=DUPLICATE_EVENT_WINDOW_SECONDS)
 
-    results = [analyze_requirement_impact(root, req_id, sorted(paths)) for req_id, paths in sorted(affected.items())]
+    results = [
+        analyze_requirement_impact(root, req_id, sorted(paths), dependency_graph=graph)
+        for req_id, paths in sorted(affected.items())
+    ]
     with connect(root) as db:
         for result in results:
             if result["evidence_freshness"] != "CURRENT":
@@ -302,6 +357,9 @@ def mark_changed_files(root: Path, changed_paths: list[str]) -> list[dict]:
                        WHERE id = ? AND status IN ('VERIFIED', 'IMPLEMENTED', 'UNVERIFIED')""",
                     (now_iso(), result["requirement_id"]),
                 )
+    if graph_problem:
+        # Direct invalidation above is complete; the transitive part is not. Do not report success.
+        raise RuntimeError(f"Transitive evidence invalidation incomplete ({graph_problem}); treat dependent evidence as unverified.")
     return results
 
 
@@ -399,6 +457,81 @@ def analyze_requirement_impact(
     return res
 
 
+IMPACT_CONFIRMED = "CONFIRMED_AFFECTED"
+IMPACT_UNKNOWN = "INCOMPLETE_UNKNOWN_IMPACT"
+IMPACT_NONE = "COMPLETE_NO_IMPACT"
+
+
+def _requirements_for_files(db, files: set[str]) -> set[str]:
+    """Requirement ids linked (directly or via a mapped test file) to any of ``files``."""
+    found: set[str] = set()
+    has_mapping = _mapping_schema_available(db)
+    for path in files:
+        for row in db.execute("SELECT requirement_id FROM requirement_files WHERE file_path=?", (path,)):
+            found.add(row["requirement_id"])
+        if has_mapping:
+            for row in db.execute("SELECT requirement_id FROM requirement_tests WHERE test_file=?", (path,)):
+                found.add(row["requirement_id"])
+    return found
+
+
+def _module_tokens(path: str) -> set[str]:
+    """Name fragments by which a project file could be imported (a.b.c.py -> {a, b, c})."""
+    parts = list(Path(path).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return set(parts)
+
+
+def _unknown_impact(db, dep_graph, normalized: list[str]) -> list[dict]:
+    """Return incompleteness that could plausibly hide a requirement from ``normalized``.
+
+    Policy (documented in README "Uncertainty policy"): incomplete analysis only matters
+    when it is *relevant*. A source file whose imports are not fully known (unparseable,
+    dynamic import, unresolved import) can hide an edge ``source -> changed_file``. That
+    edge only matters if the source file, or something that (transitively, as far as
+    known) imports it, is linked to a registered requirement. Unresolved imports are
+    further limited to changed files whose name could satisfy the import. Depth/node
+    truncation of the dependent traversal is always relevant when requirements exist.
+    """
+    all_req_ids = _requirements_for_files(db, {
+        r[0] for r in db.execute("SELECT file_path FROM requirement_files")
+    } | ({r[0] for r in db.execute("SELECT test_file FROM requirement_tests")} if _mapping_schema_available(db) else set()))
+    if not all_req_ids:
+        return []
+
+    unknown: list[dict] = []
+    changed_py = [p for p in normalized if p.endswith(".py")]
+
+    for changed in changed_py:
+        if changed in dep_graph.truncated_traversals:
+            unknown.append({
+                "source": changed, "kind": "TRAVERSAL_TRUNCATED",
+                "detail": f"Dependent traversal from {changed} hit the depth/node limit; some dependents were not examined.",
+                "requirement_ids": sorted(all_req_ids),
+            })
+
+    for source, entries in sorted(dep_graph.incomplete_sources.items()):
+        closure = {source} | dep_graph.get_transitive_dependents(source)
+        req_ids = _requirements_for_files(db, closure)
+        if source in dep_graph.truncated_traversals:
+            req_ids = set(all_req_ids)
+        if not req_ids:
+            continue
+        for entry in entries:
+            for changed in changed_py:
+                if changed == source:
+                    continue
+                if entry["kind"] == "UNRESOLVED_IMPORT" and not (set(entry["tokens"]) & _module_tokens(changed)):
+                    continue
+                unknown.append({
+                    "source": source, "kind": entry["kind"],
+                    "detail": f"{source}: {entry['detail']} (may involve {changed})",
+                    "requirement_ids": sorted(req_ids),
+                })
+    return unknown
+
+
 def analyze_change_impact(root: Path, changed_paths: list[str]) -> dict:
     """Return deterministic linked impact without executing any tests."""
     normalized = sorted({normalize_path(p) for p in changed_paths if p.strip()})
@@ -460,8 +593,18 @@ def analyze_change_impact(root: Path, changed_paths: list[str]) -> dict:
         else "LOCAL_STATIC_IMPORTS"
     )
 
+    with connect(root) as db:
+        unknown_impact = _unknown_impact(db, dep_graph, normalized)
+    determination = (
+        IMPACT_CONFIRMED if requirements
+        else IMPACT_UNKNOWN if unknown_impact
+        else IMPACT_NONE
+    )
+
     return {
         "changed_files": normalized,
+        "impact_determination": determination,
+        "unknown_impact": unknown_impact,
         "inferred_dependent_files": inferred_dependent_files,
         "requirements": requirements,
         "verification_plan": [entry for item in requirements for entry in item["verification_plan"]],

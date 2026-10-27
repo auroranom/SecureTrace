@@ -20,6 +20,7 @@ from securetrace.approval import (
     deny_proposal,
     evaluate_proposal,
     format_plain_language_warning,
+    format_warning_details,
     load_proposal,
     resolve_project_relative_path,
     save_proposal,
@@ -189,8 +190,8 @@ def test_4_security_relevant_changes_trigger_explicit_review(approval_repo: Path
     assert len(proposal.token) == 64  # HMAC-SHA256 hex string
 
 
-def test_5_warning_contains_all_required_plain_language_sections(approval_repo: Path):
-    """5. The warning contains all 6 required plain-language sections in accessible English."""
+def test_5_warning_is_compact_and_contains_required_security_information(approval_repo: Path):
+    """5. The default warning is a short summary with the key facts and no unexplained jargon."""
     proposal = evaluate_proposal(
         root=approval_repo,
         file_path="auth.py",
@@ -199,25 +200,35 @@ def test_5_warning_contains_all_required_plain_language_sections(approval_repo: 
         replacement_pattern="return True",
     )
     warning = proposal.warning_text
+    req = proposal.affected_requirements[0]
 
-    # Verify all 6 section headings
-    assert "1. What is proposed to change:" in warning
-    assert "2. What could go wrong:" in warning
-    assert "3. Why this warning appeared:" in warning
-    assert "4. How serious this potential impact is:" in warning
-    assert "5. What you can choose to do:" in warning
-    assert "6. What happens after your decision:" in warning
-
-    # Verify plain-language phrasing
+    assert len(warning.splitlines()) <= 12
+    assert "`auth.py`" in warning
+    assert proposal.diff_classification in warning
+    assert proposal.assessed_risk in warning
+    assert req["id"] in warning and req["title"] in warning and req["severity"].upper() in warning
     assert "unauthorized users" in warning
-    assert "potential security risk" in warning
-    assert "Allow / Approve" in warning
-    assert "Deny / Abort" in warning
+    assert "Antigravity's approval prompt" in warning
+    assert "does not approve or deny" in warning
+    assert proposal.proposal_id in warning
+    for old_section in ("What could go wrong", "6. What happens after your decision", "Notice on Analysis Scope"):
+        assert old_section not in warning
+    for jargon in ("AST", "transitive dependency", "fingerprint"):
+        assert jargon not in warning
 
-    # Verify technical jargon is avoided
-    assert "AST" not in warning
-    assert "transitive dependency" not in warning
-    assert "fingerprint" not in warning
+
+def test_5b_details_view_keeps_full_analysis(approval_repo: Path):
+    """The expanded details (CLI review / recorded proposal) retain evidence, linkage, and limitations."""
+    proposal = evaluate_proposal(
+        root=approval_repo, file_path="auth.py", operation="edit",
+        target_pattern="return user_role == 'admin'", replacement_pattern="return True",
+    )
+    details = format_warning_details(proposal)
+    assert proposal.proposal_id in details
+    assert "Evidence:" in details
+    assert "Static analysis is limited" in details
+    assert "directly linked" in details
+    assert "if denied, the file is not modified" in details
 
 
 def test_6_denial_preserves_original_file_content(approval_repo: Path):
@@ -356,7 +367,7 @@ def test_13_transitive_dependency_impacts_explained_accurately(approval_repo: Pa
     warning = proposal.warning_text
     # Warning should explain that requirements rely on code that imports helper.py
     assert "helper.py" in warning
-    assert "relies on code that imports" in warning
+    assert "relies on code that imports" in format_warning_details(proposal)
 
 
 def test_14_incomplete_dependency_analysis_is_disclosed(approval_repo: Path):
@@ -384,8 +395,11 @@ def test_14_incomplete_dependency_analysis_is_disclosed(approval_repo: Path):
     )
 
     if proposal.dependency_coverage == "PARTIAL_LOCAL_STATIC" or proposal.uncertainties:
-        assert "Notice on Analysis Scope" in proposal.warning_text
-        assert "could not check every possible dependency" in proposal.warning_text
+        # The short warning flags partial analysis once and points to the details; the full text lives there.
+        assert "analysis was partial" in proposal.warning_text
+        assert proposal.proposal_id in proposal.warning_text
+        assert "Static analysis is limited" in format_warning_details(proposal)
+        assert len(proposal.warning_text.splitlines()) <= 12
 
 
 def test_15_approval_integration_errors_fail_closed(approval_repo: Path):
@@ -502,7 +516,8 @@ def test_cli_review_and_approve_flow(approval_repo: Path, monkeypatch, capsys):
     main()
     captured = capsys.readouterr()
     assert proposal.proposal_id in captured.out
-    assert "SecureTrace Pre-Action Security Warning" in captured.out
+    assert "SecureTrace: " in captured.out and "review required" in captured.out
+    assert "SecureTrace details for" in captured.out
 
     # 2. Test CLI approve
     monkeypatch.setattr("sys.argv", ["securetrace", "approve", proposal.proposal_id])
@@ -554,5 +569,5 @@ def test_hook_cli_execution_via_stdin_stdout(approval_repo: Path, monkeypatch, c
     captured = capsys.readouterr()
     output = json.loads(captured.out)
     assert output["decision"] == "force_ask"
-    assert "SecureTrace Pre-Action Security Warning" in output["reason"]
+    assert "SecureTrace: " in output["reason"] and "review required" in output["reason"]
 

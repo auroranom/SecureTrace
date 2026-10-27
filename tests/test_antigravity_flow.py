@@ -89,9 +89,14 @@ def test_replace_file_content_on_protected_file_forces_ask_with_real_requirement
     assert req_id in reason
     assert "Only appointment owners can cancel" in reason
     assert "HIGH" in reason
-    assert "must not cancel an appointment owned by another user" in reason  # registered description
-    assert "does not mean a vulnerability has been found" in reason
-    assert "Try another approach" in reason
+    assert "must not cancel an appointment owned by another user" not in reason  # long description lives in details, not the warning
+    assert len(reason.splitlines()) <= 12
+    assert "Antigravity's approval prompt" in reason and "does not approve or deny" in reason
+    # The full limitations text is available in the recorded proposal's details, not repeated in the warning.
+    import re
+    from securetrace.approval import format_warning_details, load_proposal
+    proposal = load_proposal(root, re.search(r"PROP-[0-9A-F]+", reason).group(0))
+    assert "not a finding of a vulnerability" in format_warning_details(proposal)
     assert (app.read_bytes(), app.stat().st_mtime_ns) == before  # evaluation never touches the target
 
 
@@ -232,7 +237,7 @@ def test_find_reviewed_proposal_requires_exact_content_match(repo):
     root, _ = repo
     proposal = evaluate_proposal(root, "app.py", "edit", target_pattern=OWNER_CHECK, replacement_pattern="return True")
     assert find_reviewed_proposal_for_write(root, "app.py") is None  # disk still has original content
-    (root / "app.py").write_text(proposal.proposed_content, encoding="utf-8")
+    (root / "app.py").write_text(proposal.proposed_content, encoding="utf-8", newline="")
     assert find_reviewed_proposal_for_write(root, "app.py").proposal_id == proposal.proposal_id
 
 
